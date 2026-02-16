@@ -230,7 +230,7 @@ with gr.Blocks(title="SDXL Image Generator") as demo:
 
         # ---- Right column: output ----
         with gr.Column(scale=1):
-            output_image = gr.Image(label="Generated Image", type="pil")
+            output_image = gr.Image(label="Generated Image", type="pil", format="jpeg")
 
     # ---- Model management (collapsed by default) ----
     with gr.Accordion("Model Settings", open=False):
