@@ -12,6 +12,7 @@ import modal
 from config import (
     COMFYUI_BASE_URL,
     COMFYUI_CHECKPOINTS_DIR,
+    COMFYUI_LORAS_DIR,
     COMFYUI_PORT,
     MODAL_APP_NAME,
     MODAL_SECRET_NAME,
@@ -78,6 +79,12 @@ class ComfyUIBackend:
         width: int,
         height: int,
         checkpoint_name: str,
+        sampler_name: str = "dpmpp_2m",
+        scheduler: str = "karras",
+        clip_skip: int = -2,
+        lora_name: str | None = None,
+        lora_strength_model: float = 1.0,
+        lora_strength_clip: float = 1.0,
     ) -> tuple[bytes, int]:
         """Run an SDXL text-to-image generation and return (image_bytes, actual_seed)."""
         import requests
@@ -91,6 +98,12 @@ class ComfyUIBackend:
             width=width,
             height=height,
             checkpoint_name=checkpoint_name,
+            sampler_name=sampler_name,
+            scheduler=scheduler,
+            clip_skip=clip_skip,
+            lora_name=lora_name,
+            lora_strength_model=lora_strength_model,
+            lora_strength_clip=lora_strength_clip,
         )
 
         # Queue the prompt
@@ -169,6 +182,70 @@ class ComfyUIBackend:
         return filename
 
     @modal.method()
+    def download_lora(self, lora_url: str) -> str:
+        """Download a LoRA from CivitAI and persist it in the volume.
+
+        Args:
+            lora_url: A full CivitAI download URL or a bare model-version ID.
+
+        Returns:
+            The filename of the downloaded LoRA.
+        """
+        import requests as req
+
+        api_key = os.environ.get("CIVITAI_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "CIVITAI_API_KEY is not set. "
+                "Create the Modal secret first: "
+                "modal secret create civitai-api-key CIVITAI_API_KEY=<key>"
+            )
+
+        # Normalise the URL
+        if lora_url.strip().isdigit():
+            download_url = f"https://civitai.com/api/download/models/{lora_url.strip()}"
+        elif "civitai.com" in lora_url:
+            download_url = lora_url
+        else:
+            raise ValueError(f"Unrecognised LoRA URL format: {lora_url}")
+
+        # CivitAI redirects to S3 which strips headers, so pass the key as
+        # a query parameter instead of an Authorization header.
+        separator = "&" if "?" in download_url else "?"
+        download_url = f"{download_url}{separator}token={api_key}"
+
+        resp = req.get(download_url, stream=True, allow_redirects=True, timeout=600)
+        resp.raise_for_status()
+
+        # Extract filename from Content-Disposition, fall back to a safe default
+        cd = resp.headers.get("Content-Disposition", "")
+        if "filename=" in cd:
+            filename = cd.split("filename=")[-1].strip('"').strip("'")
+        else:
+            slug = lora_url.strip().split("/")[-1].split("?")[0]
+            filename = f"lora_{slug}.safetensors"
+
+        # Ensure loras subdirectory exists
+        loras_dir = Path(MODELS_DIR) / "loras"
+        loras_dir.mkdir(parents=True, exist_ok=True)
+
+        # Stream to disk
+        filepath = loras_dir / filename
+        with open(filepath, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
+                f.write(chunk)
+
+        volume.commit()
+
+        # Make the new LoRA visible to ComfyUI immediately
+        target = Path(COMFYUI_LORAS_DIR) / filename
+        if not target.exists():
+            os.symlink(filepath, target)
+
+        print(f"Downloaded and committed LoRA: {filename}")
+        return filename
+
+    @modal.method()
     def list_models(self) -> list[str]:
         """Return filenames of all checkpoints stored in the volume."""
         models_path = Path(MODELS_DIR)
@@ -176,19 +253,36 @@ class ComfyUIBackend:
             return []
         return sorted(f.name for f in models_path.glob("*.safetensors"))
 
+    @modal.method()
+    def list_loras(self) -> list[str]:
+        """Return filenames of all LoRAs stored in the volume."""
+        loras_path = Path(MODELS_DIR) / "loras"
+        if not loras_path.exists():
+            return []
+        return sorted(f.name for f in loras_path.glob("*.safetensors"))
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
     def _sync_model_symlinks(self):
-        """Create symlinks from the volume into ComfyUI's checkpoints directory."""
+        """Create symlinks from the volume into ComfyUI's checkpoints and loras directories."""
+        # Symlink checkpoints
         os.makedirs(COMFYUI_CHECKPOINTS_DIR, exist_ok=True)
         models_path = Path(MODELS_DIR)
-        if not models_path.exists():
-            return
-        for model_file in models_path.glob("*.safetensors"):
-            target = Path(COMFYUI_CHECKPOINTS_DIR) / model_file.name
-            if not target.exists():
-                os.symlink(model_file, target)
+        if models_path.exists():
+            for model_file in models_path.glob("*.safetensors"):
+                target = Path(COMFYUI_CHECKPOINTS_DIR) / model_file.name
+                if not target.exists():
+                    os.symlink(model_file, target)
+
+        # Symlink LoRAs
+        os.makedirs(COMFYUI_LORAS_DIR, exist_ok=True)
+        loras_path = Path(MODELS_DIR) / "loras"
+        if loras_path.exists():
+            for lora_file in loras_path.glob("*.safetensors"):
+                target = Path(COMFYUI_LORAS_DIR) / lora_file.name
+                if not target.exists():
+                    os.symlink(lora_file, target)
 
     def _wait_for_server(self, max_retries: int = 60, delay: float = 2.0):
         """Poll ComfyUI's /system_stats endpoint until it responds."""
